@@ -215,16 +215,51 @@ def get_tools_schema() -> list[dict]:
     return [spec.to_openai_tool() for spec in TOOL_REGISTRY.values()]
 
 
-def _error(code: str, message: str, **extra) -> str:
+def error_result(code: str, message: str, kind: str = "permanent", **extra) -> str:
     """统一构造错误结果。
 
     为什么要统一格式：模型要能读懂"哪里错了、该怎么改"。
     一个 JSON 里带上错误类型和说明，比扔一段 Python 堆栈有用得多。
 
     这个设计对应 Day1 的结论：**工具失败也是结果，要回填，不是中断。**
+
+    ---------- W3 Day1 新增：kind ----------
+    光有错误码不够。调用方（loop）真正需要知道的是：
+        **这个失败，再试一次会不会变好？**
+
+    所以每个错误都带一个 kind，分三类：
+
+        transient     瞬时故障 —— 超时、连接断、限流、5xx
+                      → 原样重试（退避后）有意义
+        permanent     持久故障 —— 权限不足、文件不存在、代码有 bug
+                      → 重试一万次也一样，别浪费时间
+        model_fixable 这次调用错了，但模型能改 —— 工具名编错、参数类型错、JSON 坏了
+                      → 原样重试没意义，但把错误喂回模型，它改参数重新发就有意义
+
+    顺带派生一个 retryable 布尔字段，方便调用方直接判断（不用写字符串比较）。
+    注意：retryable 只对 transient 为真。model_fixable 不是"重试"，是"让模型重来"。
+
+    ---------- 为什么这个函数是公开的 ----------
+    工具自己也可能要返回错误（比如"文档不存在"）。
+    如果工具自己手拼 json.dumps({"ok": False, ...})，就会出现两种错误格式：
+    执行层返回的带 kind，工具返回的不带 —— 调用方判断时直接崩。
+
+    **同一个东西只在一个地方构造**（W2 Day4 讲 finish() 时说过一次）。
+    所以工具层和执行层共用这个函数。
     """
-    payload = {"ok": False, "error": code, "message": message, **extra}
+    payload = {
+        "ok": False,
+        "error": code,
+        "kind": kind,
+        "retryable": kind == "transient",
+        "message": message,
+        **extra,
+    }
     return json.dumps(payload, ensure_ascii=False)
+
+
+# 内部旧名字，保持已有代码和文档里的调用不变
+_error = error_result
 
 
 def execute_tool(name: str, arguments_json: str) -> str:
@@ -239,6 +274,10 @@ def execute_tool(name: str, arguments_json: str) -> str:
       ② 参数不是合法 JSON
       ③ 参数不符合 schema
       ④ 工具内部抛异常
+
+    每一道都标注了 kind（W3 Day1），因为"失败的分类"决定了"接下来该怎么办"：
+      ①②③ 都是【这次调用写错了】，模型改一改就能过 → model_fixable
+      ④ 要看异常类型：网络/超时 → transient（可重试），其他 → permanent
     """
     spec = TOOL_REGISTRY.get(name)
     if spec is None:
@@ -246,13 +285,14 @@ def execute_tool(name: str, arguments_json: str) -> str:
         return _error(
             "unknown_tool",
             f"没有名为 {name} 的工具。可用工具：{list(TOOL_REGISTRY)}",
+            kind="model_fixable",
         )
 
     try:
         raw_args = json.loads(arguments_json) if arguments_json else {}
     except json.JSONDecodeError as e:
         # ② 模型给的 JSON 坏了（常见于输出被截断）
-        return _error("invalid_json", f"参数不是合法 JSON: {e}")
+        return _error("invalid_json", f"参数不是合法 JSON: {e}", kind="model_fixable")
 
     try:
         # ③ Pydantic 校验：类型、必填、取值范围全在这一步
@@ -263,13 +303,41 @@ def execute_tool(name: str, arguments_json: str) -> str:
             f"{' → '.join(str(x) for x in err['loc'])}: {err['msg']}"
             for err in e.errors()
         ]
-        return _error("invalid_args", "参数不符合要求", problems=problems)
+        return _error(
+            "invalid_args", "参数不符合要求", kind="model_fixable", problems=problems
+        )
 
     try:
         # ④ 真正执行。注意：这里捕获所有异常，不让它炸穿 loop
         result = spec.func(**args.model_dump())
     except Exception as e:  # noqa: BLE001  —— 故意捕获全部，工具出错是常态
-        return _error("tool_error", f"{type(e).__name__}: {e}")
+        # 这里的关键判断：这个异常是"环境暂时不好"还是"代码有问题"？
+        #
+        # OSError 家族（含 TimeoutError、ConnectionError）基本都跟网络/IO 有关，
+        # 属于"过一会儿可能就好了" → transient，值得重试。
+        #
+        # 但有两个例外必须排掉：PermissionError 和 FileNotFoundError
+        # 虽然也是 OSError 的子类，却属于【持久故障】——
+        # 权限不会因为多试几次就给你，文件也不会自己长出来。
+        #
+        # ⚠️ 这个坑是实测发现的：一开始只写 isinstance(e, OSError)，
+        #    结果"权限不足"被判成 transient，loop 会傻等重试 3 次才放弃。
+        #
+        # 其他异常（ValueError / KeyError / TypeError / ZeroDivisionError…）
+        # 说明代码本身有 bug 或者数据不对，重试一万次结果一样 → permanent。
+        #
+        # ⚠️ 就算有上面两条例外，这个判断仍然是"猜"的 ——
+        # 执行层看不到工具内部到底在干什么。
+        # 更成熟的做法是让【工具自己声明】它抛的是什么性质的错
+        # （自定义 TransientToolError / PermanentToolError），
+        # 执行层只需要 isinstance 判断。Day2 会讲到这一点。
+        _PERMANENT_OS_ERRORS = (PermissionError, FileNotFoundError)
+        is_transient = isinstance(e, OSError) and not isinstance(e, _PERMANENT_OS_ERRORS)
+        return _error(
+            "tool_error",
+            f"{type(e).__name__}: {e}",
+            kind="transient" if is_transient else "permanent",
+        )
 
     # 成功也要包一层，让模型能区分"结果"和"错误"
     return json.dumps({"ok": True, "result": result}, ensure_ascii=False)

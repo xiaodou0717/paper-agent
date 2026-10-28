@@ -29,7 +29,7 @@ import json
 import re
 from pathlib import Path
 
-from agent.tools import tool
+from agent.tools import error_result, tool
 
 # 语料目录：本文件在 paper-agent/agent/ 下，父目录的父目录就是 paper-agent/
 #   Path(__file__).resolve()  → D:\开发岗学习计划\paper-agent\agent\tools_impl.py
@@ -167,18 +167,17 @@ def search_docs(query: str, top_k: int = 3) -> str:
     # 返回人话，不抛异常 —— 模型看到"文档库不存在"会如实告诉用户，
     # 而不是整个任务崩掉。
     if not CORPUS_DIR.exists():
-        return json.dumps(
-            {"ok": False, "error": "corpus_missing",
-             "message": f"文档库目录不存在：{CORPUS_DIR}"},
-            ensure_ascii=False,
+        # permanent：目录不存在，重试一百次也不会出现。要么部署时补上，要么改配置。
+        return error_result(
+            "corpus_missing",
+            f"文档库目录不存在：{CORPUS_DIR}",
+            kind="permanent",
         )
 
     q_tokens = set(_tokenize(query))
     if not q_tokens:
-        return json.dumps(
-            {"ok": False, "error": "empty_query", "message": "搜索词为空"},
-            ensure_ascii=False,
-        )
+        # model_fixable：模型给了个空查询，它换个词就行
+        return error_result("empty_query", "搜索词为空", kind="model_fixable")
 
     # 参数兜底：模型可能传 top_k=100
     top_k = max(1, min(int(top_k), 5))
@@ -250,20 +249,22 @@ def read_doc(doc_id: str) -> str:
     # 所以：只允许字母、数字、下划线、连字符。
     # 这条规则把路径分隔符和点号全挡在外面。
     if not re.fullmatch(r"[A-Za-z0-9_\-]+", doc_id):
-        return json.dumps(
-            {"ok": False, "error": "invalid_doc_id",
-             "message": "doc_id 只能包含字母、数字、下划线、连字符"},
-            ensure_ascii=False,
+        # model_fixable：模型传了非法 id（可能是被提示词注入诱导的 ../.env）
+        return error_result(
+            "invalid_doc_id",
+            "doc_id 只能包含字母、数字、下划线、连字符",
+            kind="model_fixable",
         )
 
     path = CORPUS_DIR / f"{doc_id}.md"
     if not path.exists():
         available = [p.stem for p in sorted(CORPUS_DIR.glob("*.md"))]
-        return json.dumps(
-            {"ok": False, "error": "doc_not_found",
-             "message": f"没有 id 为 {doc_id} 的文档",
-             "available": available},
-            ensure_ascii=False,
+        # model_fixable：模型编了个不存在的 id，把可用列表给它，它就会挑对
+        return error_result(
+            "doc_not_found",
+            f"没有 id 为 {doc_id} 的文档",
+            kind="model_fixable",
+            available=available,
         )
 
     content = _read_text(path)
