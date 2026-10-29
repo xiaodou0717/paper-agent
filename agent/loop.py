@@ -28,7 +28,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -37,7 +36,8 @@ import httpx2 as _httpx
 from openai import AsyncOpenAI
 
 import config
-from agent.tools import execute_tool, get_tools_schema
+from agent.retry import execute_with_retry
+from agent.tools import get_tools_schema
 
 # 默认最大步数。
 # "步"= 一次模型调用 + 它要求的那批工具执行。
@@ -87,6 +87,7 @@ class AgentResult:
     stop_reason: str                   # 为什么停：见下面的取值说明
     steps: int                         # 实际走了几步（模型调了几次）
     tool_calls: int                    # 一共执行了多少次工具
+    retries: int = 0                   # 其中有多少次是重试（W3 Day2 新增）
     prompt_tokens: int = 0             # 累计输入 token（多轮相加）
     completion_tokens: int = 0         # 累计输出 token
     elapsed: float = 0.0               # 墙钟耗时（秒），从开始到退出的总时间
@@ -115,9 +116,10 @@ class AgentResult:
     def summary(self) -> str:
         """一行摘要，调试和写笔记时用。"""
         flag = "✅" if self.succeeded else "⚠️"
+        retry_part = f" retries={self.retries}" if self.retries else ""
         return (
             f"{flag} stop={self.stop_reason} steps={self.steps} "
-            f"tool_calls={self.tool_calls} tokens={self.total_tokens} "
+            f"tool_calls={self.tool_calls}{retry_part} tokens={self.total_tokens} "
             f"elapsed={self.elapsed:.2f}s"
         )
 
@@ -212,6 +214,7 @@ async def run_agent(
     total_prompt_tokens = 0
     total_completion_tokens = 0
     total_tool_calls = 0
+    total_retries = 0
 
     # 记录当前走到第几步。
     # 单独用变量存，是因为异常处理里也要用到它（for 循环的变量出了循环就没了）。
@@ -235,6 +238,7 @@ async def run_agent(
             stop_reason=reason,
             steps=current_step,
             tool_calls=total_tool_calls,
+            retries=total_retries,
             prompt_tokens=total_prompt_tokens,
             completion_tokens=total_completion_tokens,
             elapsed=time.perf_counter() - t_start,
@@ -375,17 +379,30 @@ async def run_agent(
             for tc in calls:
                 log(f"  → {tc.function.name}({tc.function.arguments})")
 
-                # 为什么用 asyncio.to_thread？
-                # 因为 execute_tool 是同步函数（普通 def），直接在 async 里调用
-                # 会阻塞整个事件循环 —— 这是 W1 Day2 实验 2 演示过的现象。
-                # to_thread 把它丢到后台线程，事件循环就能继续干别的。
+                # 为什么用 execute_with_retry 而不是 execute_tool？
+                # 因为 execute_tool 只执行一次；遇到 transient 失败（超时、限流）
+                # 它虽然返回了 retryable=true，但没人去重试 —— 这个信息就白有了。
                 #
-                # 今天的假工具是瞬间返回的，看不出差别；
-                # 但 Day5 接真实工具（可能读文件、发网络请求）时，这就很关键。
-                result = await asyncio.to_thread(
-                    execute_tool, tc.function.name, tc.function.arguments
+                # execute_with_retry 做的事：执行 → 判断结果是不是 transient →
+                # 是的话退避等待 → 再执行，最多 N 次。
+                #
+                # 注意：**这是 loop 里唯一为"重试"改动的一行。**
+                # 重试的全部逻辑（退避、抖动、上限、总时长预算）
+                # 都在 agent/retry.py 里，loop 不需要知道细节。
+                #
+                # 这也是分层的价值：以后要换重试策略（比如加熔断），只改 retry.py。
+                outcome = await execute_with_retry(
+                    tc.function.name, tc.function.arguments
                 )
                 total_tool_calls += 1
+                if outcome.retried:
+                    total_retries += outcome.attempts - 1
+                    log(
+                        f"  ↻ 重试 {outcome.attempts - 1} 次，"
+                        f"累计退避 {outcome.total_delay:.2f}s"
+                    )
+
+                result = outcome.raw
 
                 log(f"  ← {result[:120]}")
 
