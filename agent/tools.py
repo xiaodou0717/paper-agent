@@ -37,6 +37,8 @@ from typing import Any, Callable, get_type_hints
 
 from pydantic import BaseModel, ValidationError, create_model
 
+from agent.parse import extract_json, looks_truncated
+
 
 # ============================================================
 # 数据结构
@@ -291,8 +293,26 @@ def execute_tool(name: str, arguments_json: str) -> str:
     try:
         raw_args = json.loads(arguments_json) if arguments_json else {}
     except json.JSONDecodeError as e:
-        # ② 模型给的 JSON 坏了（常见于输出被截断）
-        return _error("invalid_json", f"参数不是合法 JSON: {e}", kind="model_fixable")
+        # ② 模型给的 JSON 坏了。
+        #
+        # 先别急着放弃 —— 很多时候只是"格式脏了"（包了代码块、带了解释文字、
+        # 多了尾随逗号），本地宽松解析一下就能救回来，**不花一分钱**（W3 Day4）。
+        #
+        # 只有救不回来才报错。这个顺序很重要：
+        # 先重试再解析的话，这几种本地能解决的问题会白花一轮 token。
+        salvaged = extract_json(arguments_json)
+        if salvaged.ok and isinstance(salvaged.data, dict):
+            raw_args = salvaged.data
+        else:
+            # 报错时带上 truncated 标记：**截断和格式错的处理方式完全不同**。
+            #   格式错 → 让模型"注意格式，重新给"
+            #   截断   → 让模型"说短一点"或调大 max_tokens，重试才有意义
+            return _error(
+                "invalid_json",
+                f"参数不是合法 JSON: {e}",
+                kind="model_fixable",
+                truncated=looks_truncated(arguments_json),
+            )
 
     try:
         # ③ Pydantic 校验：类型、必填、取值范围全在这一步
