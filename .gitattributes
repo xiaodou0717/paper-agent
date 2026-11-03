@@ -1,0 +1,21 @@
+# 统一换行符：仓库里和工作区里都用 LF
+#
+# 为什么需要这个文件？
+#   Windows 上 Git 默认 core.autocrlf=true，行为是：
+#     提交时 CRLF → LF（存进仓库）
+#     检出时 LF → CRLF（写进工作区）
+#
+#   于是每次 git checkout / pull / reset 之后，工作区文件都会变成 CRLF。
+#   而 CRLF 会让某些 markdown 渲染器出问题：
+#     段落挤成一团、代码围栏和 <details> 标签裸露成文字。
+#
+#   这个文件覆盖 autocrlf，强制两边都用 LF，不管本机配置是什么。
+* text=auto eol=lf
+
+# 二进制文件不要做换行符转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.pdf binary
+*.ico binary
