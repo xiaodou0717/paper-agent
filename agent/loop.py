@@ -68,6 +68,57 @@ DEFAULT_MAX_SECONDS = 120.0
 # 结果：一次运行的完整产出
 # ============================================================
 
+def _msg_chars(m: Any) -> int:
+    """安全地算一条消息的内容长度。
+
+    为什么需要这个函数？
+        messages 列表里混着两种东西：
+          - dict：我们自己 append 的 system / user / tool 消息
+          - SDK 对象：模型返回的 assistant 消息（W2 Day3 学过"原样放回历史"）
+
+    对 dict 用 `.get()`，对对象用 `getattr`。一刀切会炸。
+
+    ⚠️ 这个函数是踩坑后加的：一开始写了 `m.get("content")`，
+       结果第 2 轮遇到 SDK 对象就抛 AttributeError，
+       **把整个任务搞挂了**——观测代码的 bug 拖垮了主流程。
+    """
+    content = m.get("content") if isinstance(m, dict) else getattr(m, "content", None)
+    return len(str(content)) if content else 0
+
+
+@dataclass
+class StepLog:
+    """一轮调用的快照 —— W4 观察上下文用。
+
+    为什么总 token 不够？
+        它只告诉你"这个任务花了 8000"，不告诉你"从第几轮开始变贵的"。
+        而上下文工程的全部优化，都建立在**看清每一轮的真实成本**上。
+
+    三个关键数字，各有各的用处：
+
+        prompt_tokens     这一轮实际发过去的 token = **当前上下文的大小**
+        chars_in_context  消息内容的字符数（和 token 对照，能看出 token/字符比）
+        n_messages        消息条数（判断"历史膨胀"还是"单条太长"）
+
+    为什么 token 和字符数都要记？
+        因为它们的比值会变。中文约 1.5 字符/token，英文约 4 字符/token。
+        当一个工具返回大段代码时，比值会明显变化——
+        这是判断"哪种内容最吃 token"的依据（W5 做截断策略时会用到）。
+    """
+    step: int                 # 第几轮
+    prompt_tokens: int        # 这一轮的输入 token（服务商返回的）
+    completion_tokens: int    # 这一轮的输出 token
+    total_so_far: int         # 到这一轮为止累计花了多少
+    n_messages: int           # 发过去时有多少条消息
+    chars_in_context: int     # 这些消息的内容字符数
+    finish_reason: str        # 这一轮的结束原因
+
+    @property
+    def tokens_per_char(self) -> float:
+        """token / 字符 的比值。中文场景大约 0.6~0.7，英文大约 0.25。"""
+        return self.prompt_tokens / self.chars_in_context if self.chars_in_context else 0.0
+
+
 @dataclass
 class AgentResult:
     """一次 Agent 运行的全部结果。
@@ -92,6 +143,7 @@ class AgentResult:
     completion_tokens: int = 0         # 累计输出 token
     elapsed: float = 0.0               # 墙钟耗时（秒），从开始到退出的总时间
     messages: list[Any] = field(default_factory=list)   # 完整对话历史
+    step_logs: list["StepLog"] = field(default_factory=list)   # 每轮快照（W4 Day1 新增）
 
     @property
     def total_tokens(self) -> int:
@@ -215,6 +267,7 @@ async def run_agent(
     total_completion_tokens = 0
     total_tool_calls = 0
     total_retries = 0
+    step_logs: list[StepLog] = []      # 每轮快照，W4 观察上下文用
 
     # 记录当前走到第几步。
     # 单独用变量存，是因为异常处理里也要用到它（for 循环的变量出了循环就没了）。
@@ -243,6 +296,7 @@ async def run_agent(
             completion_tokens=total_completion_tokens,
             elapsed=time.perf_counter() - t_start,
             messages=messages,
+            step_logs=step_logs,
         )
 
     log("=" * 60)
@@ -308,6 +362,30 @@ async def run_agent(
             if response.usage:
                 total_prompt_tokens += response.usage.prompt_tokens
                 total_completion_tokens += response.usage.completion_tokens
+
+            # ---------- 每轮快照（W4 Day1 新增）----------
+            # 记下这一轮"发过去多大"。这是上下文工程全部优化的度量基础：
+            #   不加这一步，你只知道总花费，不知道钱花在哪一轮、为什么贵。
+            #
+            # 注意 prompt_tokens 记的是【本轮】的，不是累计的 ——
+            # 它等于"当前上下文的大小"，这才是我们要看的曲线。
+            #
+            # ⚠️ 整段用 try 包起来，理由很重要：
+            #    观测代码出错，绝不能影响任务本身。
+            #    （我第一版没包，结果取 content 时抛异常，整个任务被判 error）
+            #    丢一条日志是小事，任务白跑是大事。
+            try:
+                step_logs.append(StepLog(
+                    step=step,
+                    prompt_tokens=response.usage.prompt_tokens if response.usage else 0,
+                    completion_tokens=response.usage.completion_tokens if response.usage else 0,
+                    total_so_far=total_prompt_tokens + total_completion_tokens,
+                    n_messages=len(messages),
+                    chars_in_context=sum(_msg_chars(m) for m in messages),
+                    finish_reason=choice.finish_reason or "unknown",
+                ))
+            except Exception as e:  # noqa: BLE001
+                log(f"  ⚠️ 记录快照失败（不影响任务）：{type(e).__name__}: {e}")
 
             # ==================================================
             # ② 要不要工具：看 finish_reason，不要看 content 有没有值
