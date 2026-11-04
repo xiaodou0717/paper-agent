@@ -37,6 +37,7 @@ from openai import AsyncOpenAI
 
 import config
 from agent.retry import execute_with_retry
+from agent.budget import plan_call, trim_tool_results
 from agent.tools import get_tools_schema
 
 # 默认最大步数。
@@ -216,6 +217,7 @@ async def run_agent(
     max_tokens: int = DEFAULT_MAX_TOKENS,
     token_budget: int | None = DEFAULT_TOKEN_BUDGET,
     max_seconds: float | None = DEFAULT_MAX_SECONDS,
+    enable_compaction: bool = True,
     verbose: bool = True,
 ) -> AgentResult:
     """跑一次完整的 Agent 任务。
@@ -325,15 +327,69 @@ async def run_agent(
                 log(f"⏱️ 时间超限：已用 {elapsed_now:.1f}s ≥ 上限 {max_seconds}s，不再发起新请求")
                 return finish("timeout")
 
-            # ---- 护栏②：token 预算 ----
-            # 注意这个方法有个【天生的缺陷】：不调用就不知道这次要花多少，
-            # 所以只能"花掉之后才知道超了"。结果是最终会超出预算一点点。
-            # 这不是 bug，是这类预算的固有性质 —— 想少超就留余量，
-            # 比如 budget 设 45000 而心里按 50000 用（W3 会讲更细的做法）。
+            # ---- 护栏②：token 预算（W4 Day3 升级：先压缩，压不动才停）----
+            #
+            # 原来的做法只有一个动作："花完了就停"。
+            # 问题是它只能刹车、不能省油 —— 停下来的任务等于白花钱。
+            #
+            # 现在多了一步：**调用前先算这次要花多少，装不下就先压缩**。
+            #
+            #   旧：超预算 → 停
+            #   新：超预算 → 压缩 → 再算一遍 → 还不够才停
+            #
+            # 为什么"再算一遍"很重要？
+            #   不重算就是在猜压缩后够不够。可能压过头（白丢信息），
+            #   也可能压不够（还是超）。**压缩的效果必须重新度量。**
+            #
+            # ⚠️ 压缩不是万能的：如果上下文里没有可压缩的东西
+            #    （比如只有 system + 一句用户问题），压完还是超，该停就得停。
             spent = total_prompt_tokens + total_completion_tokens
-            if token_budget is not None and spent >= token_budget:
-                log(f"💰 token 预算耗尽：已用 {spent} ≥ 上限 {token_budget}，不再发起新请求")
-                return finish("budget")
+
+            if token_budget is not None:
+                plan = plan_call(messages, tools, token_budget, spent, max_tokens)
+
+                if not plan.fits:
+                    log(f"📊 {plan.summary()}")
+
+                    if enable_compaction:
+                        # ---------- 可能要压好几轮 ----------
+                        # 为什么不能只压一次？
+                        #   因为 trim_chars_needed 是按"刚好够"算的，
+                        #   但压缩有粒度（一次压到 800 字符），可能压不够；
+                        #   而且估算本身还有 ±10% 误差。
+                        #
+                        # 所以做法是：压 → 重算 → 还超就压得更狠（上限减半）。
+                        # 最多 3 轮（800 → 400 → 200），再压不动就认了。
+                        limit = 800
+                        for round_no in range(1, 4):
+                            messages, saved_chars = trim_tool_results(
+                                messages, plan.trim_chars_needed,
+                                per_result_limit=limit,
+                            )
+                            if not saved_chars:
+                                log("  ✂️ 没有可压缩的工具结果了")
+                                break
+
+                            log(f"  ✂️ 第 {round_no} 轮压缩：省约 {saved_chars} 字符"
+                                f"（单条上限 {limit}）")
+
+                            # 压完立刻重算 —— 这一行是"压缩"能成立的关键
+                            plan = plan_call(
+                                messages, tools, token_budget, spent, max_tokens
+                            )
+                            if plan.fits:
+                                log(f"  ✅ 压缩后装得下：预计 {plan.estimated_total}"
+                                    f" ≤ 剩余 {plan.remaining}")
+                                break
+
+                            limit = max(100, limit // 2)
+
+                    if not plan.fits:
+                        log(
+                            f"💰 压缩后仍装不下"
+                            f"（预计 {plan.estimated_total} > 剩余 {plan.remaining}），停止"
+                        )
+                        return finish("budget")
 
             # ==================================================
             # ① 调模型
