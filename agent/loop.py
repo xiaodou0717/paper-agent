@@ -39,6 +39,7 @@ import config
 from agent.retry import execute_with_retry
 from agent.budget import plan_call, trim_tool_results
 from agent.tools import get_tools_schema
+from agent.window import sliding_window
 
 # 默认最大步数。
 # "步"= 一次模型调用 + 它要求的那批工具执行。
@@ -218,6 +219,7 @@ async def run_agent(
     token_budget: int | None = DEFAULT_TOKEN_BUDGET,
     max_seconds: float | None = DEFAULT_MAX_SECONDS,
     enable_compaction: bool = True,
+    window_keep_rounds: int | None = None,
     verbose: bool = True,
 ) -> AgentResult:
     """跑一次完整的 Agent 任务。
@@ -344,6 +346,24 @@ async def run_agent(
             # ⚠️ 压缩不是万能的：如果上下文里没有可压缩的东西
             #    （比如只有 system + 一句用户问题），压完还是超，该停就得停。
             spent = total_prompt_tokens + total_completion_tokens
+
+            # ---- W5 Day1：滑动窗口（可选，在预算判断之前）----
+            # 顺序很重要：**先丢整轮，再压单条**。
+            #   丢整轮 = 扔掉已经用过、不会再看的早期结果（损失小）
+            #   压单条 = 把长内容截短（损失大，会丢细节）
+            #
+            # 反过来做就浪费了：先把每条都压到 400 字符，
+            # 再发现"其实整轮都可以不要"，那些压缩就白费了。
+            if window_keep_rounds:
+                wr = sliding_window(
+                    messages, keep_head=2, keep_tail_rounds=window_keep_rounds
+                )
+                if wr.changed:
+                    messages = wr.messages
+                    log(f"  {wr.summary()}")
+                elif not wr.ok:
+                    # 校验没过就保持原样 —— 宁可多花 token，不发非法请求
+                    log(f"  {wr.summary()}")
 
             if token_budget is not None:
                 plan = plan_call(messages, tools, token_budget, spent, max_tokens)
