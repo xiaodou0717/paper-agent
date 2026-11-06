@@ -40,6 +40,7 @@ from agent.retry import execute_with_retry
 from agent.budget import plan_call, trim_tool_results
 from agent.compactor import compact_with_summary
 from agent.tools import get_tools_schema
+from agent.truncate import shrink_tool_result
 from agent.window import sliding_window
 
 # 默认最大步数。
@@ -145,6 +146,7 @@ class AgentResult:
     prompt_tokens: int = 0             # 累计输入 token（多轮相加）
     completion_tokens: int = 0         # 累计输出 token
     summary_tokens: int = 0            # 其中摘要调用花掉的（W5 Day2 新增，已含在上面两项里）
+    trimmed_chars: int = 0             # 工具结果被截掉多少字符（W5 Day3 新增）
     elapsed: float = 0.0               # 墙钟耗时（秒），从开始到退出的总时间
     messages: list[Any] = field(default_factory=list)   # 完整对话历史
     step_logs: list["StepLog"] = field(default_factory=list)   # 每轮快照（W4 Day1 新增）
@@ -223,6 +225,7 @@ async def run_agent(
     enable_compaction: bool = True,
     window_keep_rounds: int | None = None,
     summary_keep_rounds: int | None = None,
+    tool_result_limit: int | None = None,
     verbose: bool = True,
 ) -> AgentResult:
     """跑一次完整的 Agent 任务。
@@ -243,6 +246,10 @@ async def run_agent(
         summary_keep_rounds  摘要压缩保留最近几轮（W5 Day2）。None = 不开
                              和 window_keep_rounds **二选一**：两个都开，
                              滑窗会先把轮次丢掉，摘要就没东西可压了
+        tool_result_limit    单条工具结果的字符上限（W5 Day3）。None = 不截
+                             注意这是**写入时**截断：全文从没进过上下文。
+                             和 budget 里那个"事后压缩"不是一回事（那个还在，
+                             作为预算真撑不住时的最后一道保险）
         verbose       是否打印每一步（学习阶段开着，跑评测时关掉）
 
     返回：
@@ -279,6 +286,7 @@ async def run_agent(
     total_tool_calls = 0
     total_retries = 0
     total_summary_tokens = 0           # 摘要调用的开销（W5 Day2）
+    total_trimmed_chars = 0            # 工具结果截掉的字符数（W5 Day3）
     step_logs: list[StepLog] = []      # 每轮快照，W4 观察上下文用
 
     # 记录当前走到第几步。
@@ -307,6 +315,7 @@ async def run_agent(
             prompt_tokens=total_prompt_tokens,
             completion_tokens=total_completion_tokens,
             summary_tokens=total_summary_tokens,
+            trimmed_chars=total_trimmed_chars,
             elapsed=time.perf_counter() - t_start,
             messages=messages,
             step_logs=step_logs,
@@ -602,6 +611,20 @@ async def run_agent(
                     )
 
                 result = outcome.raw
+
+                # ---- W5 Day3：写入时就截断 ----
+                # 为什么放在这里，而不是等预算报警再回头压？
+                #   事后压：全文已经进过上下文，峰值早就顶上去了
+                #   写入时截：全文从没进过上下文，峰值根本不会高
+                # Day2 的"峰值由最近几轮决定"就是在说这件事。
+                #
+                # ⚠️ 裁掉的内容没有消失：truncate.py 会先落盘，结果里留 artifact 句柄，
+                #    模型需要时用 fetch_artifact 取回（信息不丢，只是不在上下文里）。
+                if tool_result_limit:
+                    result, cut = shrink_tool_result(result, tool_result_limit)
+                    if cut:
+                        total_trimmed_chars += cut
+                        log(f"  ✂️ {tc.function.name}: {len(outcome.raw)} → {len(result)} 字符（省 {cut}）")
 
                 log(f"  ← {result[:120]}")
 
