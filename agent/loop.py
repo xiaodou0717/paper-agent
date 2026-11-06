@@ -38,6 +38,7 @@ from openai import AsyncOpenAI
 import config
 from agent.retry import execute_with_retry
 from agent.budget import plan_call, trim_tool_results
+from agent.compactor import compact_with_summary
 from agent.tools import get_tools_schema
 from agent.window import sliding_window
 
@@ -143,6 +144,7 @@ class AgentResult:
     retries: int = 0                   # 其中有多少次是重试（W3 Day2 新增）
     prompt_tokens: int = 0             # 累计输入 token（多轮相加）
     completion_tokens: int = 0         # 累计输出 token
+    summary_tokens: int = 0            # 其中摘要调用花掉的（W5 Day2 新增，已含在上面两项里）
     elapsed: float = 0.0               # 墙钟耗时（秒），从开始到退出的总时间
     messages: list[Any] = field(default_factory=list)   # 完整对话历史
     step_logs: list["StepLog"] = field(default_factory=list)   # 每轮快照（W4 Day1 新增）
@@ -220,6 +222,7 @@ async def run_agent(
     max_seconds: float | None = DEFAULT_MAX_SECONDS,
     enable_compaction: bool = True,
     window_keep_rounds: int | None = None,
+    summary_keep_rounds: int | None = None,
     verbose: bool = True,
 ) -> AgentResult:
     """跑一次完整的 Agent 任务。
@@ -236,6 +239,10 @@ async def run_agent(
                       传 None 表示不限
         max_seconds   整个任务的时间上限，单位秒（护栏③，防卡死）
                       传 None 表示不限
+        window_keep_rounds   滑动窗口保留最近几轮（W5 Day1）。None = 不开
+        summary_keep_rounds  摘要压缩保留最近几轮（W5 Day2）。None = 不开
+                             和 window_keep_rounds **二选一**：两个都开，
+                             滑窗会先把轮次丢掉，摘要就没东西可压了
         verbose       是否打印每一步（学习阶段开着，跑评测时关掉）
 
     返回：
@@ -271,6 +278,7 @@ async def run_agent(
     total_completion_tokens = 0
     total_tool_calls = 0
     total_retries = 0
+    total_summary_tokens = 0           # 摘要调用的开销（W5 Day2）
     step_logs: list[StepLog] = []      # 每轮快照，W4 观察上下文用
 
     # 记录当前走到第几步。
@@ -298,6 +306,7 @@ async def run_agent(
             retries=total_retries,
             prompt_tokens=total_prompt_tokens,
             completion_tokens=total_completion_tokens,
+            summary_tokens=total_summary_tokens,
             elapsed=time.perf_counter() - t_start,
             messages=messages,
             step_logs=step_logs,
@@ -364,6 +373,42 @@ async def run_agent(
                 elif not wr.ok:
                     # 校验没过就保持原样 —— 宁可多花 token，不发非法请求
                     log(f"  {wr.summary()}")
+
+            # ---- W5 Day2：历史摘要（可选，在滑窗之后、预算判断之前）----
+            #
+            # 和滑窗的区别，一句话：
+            #   滑窗 = 把早期轮次**删掉**（信息没了）
+            #   摘要 = 把早期轮次**压成一段话**（骨架还在）
+            #
+            # 为什么放在预算判断之前？
+            #   因为摘要会改变上下文大小，而预算判断要用"改变后的大小"来算。
+            #   放在后面就成了"用旧尺寸量新衣服"。
+            #
+            # 为什么不放在滑窗之前？
+            #   先丢的应该是"整段都没用的"（零成本、零损失），
+            #   再压"有用但太占地方的"（要花钱、会丢细节）。
+            #   **损失小的动作排在前面。**
+            if summary_keep_rounds is not None:
+                comp = await compact_with_summary(
+                    client,
+                    messages,
+                    keep_head=2,
+                    keep_tail_rounds=summary_keep_rounds,
+                    model=model,
+                )
+                if comp.changed:
+                    messages = comp.messages
+                    # ⚠️ 摘要调用本身也花钱，必须记进总账。
+                    #   不记的后果很隐蔽：你以为省了 2 万 token，
+                    #   实际是"上下文省 2.5 万、摘要调用花 5 千"，净省 2 万 ——
+                    #   但账面上只看到"总 token 变少了"，说不出钱去哪了。
+                    total_prompt_tokens += comp.prompt_tokens
+                    total_completion_tokens += comp.completion_tokens
+                    total_summary_tokens += comp.prompt_tokens + comp.completion_tokens
+                    log(f"  {comp.summary()}")
+                elif not comp.ok:
+                    # 失败也照跑：上下文没变，只是继续贵着
+                    log(f"  {comp.summary()}")
 
             if token_budget is not None:
                 plan = plan_call(messages, tools, token_budget, spent, max_tokens)
