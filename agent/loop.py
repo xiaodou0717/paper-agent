@@ -38,6 +38,7 @@ from openai import AsyncOpenAI
 import config
 from agent.retry import execute_with_retry
 from agent.budget import plan_call, trim_tool_results
+from agent.cache import parse_usage
 from agent.compactor import compact_with_summary
 from agent.tools import get_tools_schema
 from agent.truncate import shrink_tool_result
@@ -116,6 +117,7 @@ class StepLog:
     n_messages: int           # 发过去时有多少条消息
     chars_in_context: int     # 这些消息的内容字符数
     finish_reason: str        # 这一轮的结束原因
+    cached_tokens: int = 0    # 其中命中前缀缓存的部分（W5 Day4 新增）
 
     @property
     def tokens_per_char(self) -> float:
@@ -145,6 +147,7 @@ class AgentResult:
     retries: int = 0                   # 其中有多少次是重试（W3 Day2 新增）
     prompt_tokens: int = 0             # 累计输入 token（多轮相加）
     completion_tokens: int = 0         # 累计输出 token
+    cached_tokens: int = 0             # 其中命中前缀缓存的（W5 Day4 新增，已含在 prompt_tokens 里）
     summary_tokens: int = 0            # 其中摘要调用花掉的（W5 Day2 新增，已含在上面两项里）
     trimmed_chars: int = 0             # 工具结果被截掉多少字符（W5 Day3 新增）
     elapsed: float = 0.0               # 墙钟耗时（秒），从开始到退出的总时间
@@ -155,6 +158,16 @@ class AgentResult:
     def total_tokens(self) -> int:
         """总 token 数。"""
         return self.prompt_tokens + self.completion_tokens
+
+    @property
+    def cache_hit_rate(self) -> float:
+        """输入里有多少比例命中前缀缓存（W5 Day4）。
+
+        为什么要单独算一个比率？
+            绝对值没法和别的任务比（任务长短不同），比率可以。
+            而且"命中率有没有随轮次上升"是判断"历史是否被改写"的最直接信号。
+        """
+        return self.cached_tokens / self.prompt_tokens if self.prompt_tokens else 0.0
 
     @property
     def succeeded(self) -> bool:
@@ -287,6 +300,7 @@ async def run_agent(
     total_retries = 0
     total_summary_tokens = 0           # 摘要调用的开销（W5 Day2）
     total_trimmed_chars = 0            # 工具结果截掉的字符数（W5 Day3）
+    total_cached_tokens = 0            # 命中前缀缓存的 token（W5 Day4）
     step_logs: list[StepLog] = []      # 每轮快照，W4 观察上下文用
 
     # 记录当前走到第几步。
@@ -314,6 +328,7 @@ async def run_agent(
             retries=total_retries,
             prompt_tokens=total_prompt_tokens,
             completion_tokens=total_completion_tokens,
+            cached_tokens=total_cached_tokens,
             summary_tokens=total_summary_tokens,
             trimmed_chars=total_trimmed_chars,
             elapsed=time.perf_counter() - t_start,
@@ -505,6 +520,11 @@ async def run_agent(
             #    （我第一版没包，结果取 content 时抛异常，整个任务被判 error）
             #    丢一条日志是小事，任务白跑是大事。
             try:
+                # 前缀缓存命中（W5 Day4）。
+                # 放在 try 里：解析 usage 是观测代码，出问题不能拖垮任务。
+                cache_stats = parse_usage(response.usage)
+                total_cached_tokens += cache_stats.cached_tokens
+
                 step_logs.append(StepLog(
                     step=step,
                     prompt_tokens=response.usage.prompt_tokens if response.usage else 0,
@@ -513,6 +533,7 @@ async def run_agent(
                     n_messages=len(messages),
                     chars_in_context=sum(_msg_chars(m) for m in messages),
                     finish_reason=choice.finish_reason or "unknown",
+                    cached_tokens=cache_stats.cached_tokens,
                 ))
             except Exception as e:  # noqa: BLE001
                 log(f"  ⚠️ 记录快照失败（不影响任务）：{type(e).__name__}: {e}")
